@@ -1,0 +1,275 @@
+# .github/workflows/require-jira-ticket.yaml
+#
+# Lives in upwindsecurity/infra-github-actions (repository_id 590621660).
+# NOT called by other repos — the org ruleset "require-jira-ticket" injects it
+# into every targeted repo, so no file is distributed anywhere.
+#
+# Validates against LIVE Jira. A well-formed but invented key (UP-99999) fails.
+# A ticket closed BEFORE the PR was opened fails (retro-attaching); one that
+# closes while the PR is in flight is fine.
+
+name: Require Jira Ticket
+
+on:
+  pull_request:
+    branches: [main]
+    # The ruleset IGNORES any `types:` filter here and only fires on
+    # opened / synchronize / reopened. `edited` will NOT trigger a run — which
+    # is why the title is read from the API below, so "Re-run failed jobs"
+    # picks up a corrected title.
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  jira-ticket:
+    name: jira-ticket
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Validate the PR against Jira
+        env:
+          GH_TOKEN:   ${{ github.token }}
+          REPO:       ${{ github.repository }}
+          PR:         ${{ github.event.pull_request.number }}
+          PR_AUTHOR:  ${{ github.event.pull_request.user.login }}
+          # This file is public so that PUBLIC repos can fetch it too (a ruleset
+          # can only inject a workflow the target repo can read). Two consequences
+          # are handled below: a public PR must not publish Jira content, and a
+          # fork PR never receives secrets.
+          IS_PRIVATE: ${{ github.event.repository.private }}
+          IS_FORK:    ${{ github.event.pull_request.head.repo.fork }}
+          # Scoped API tokens authenticate against api.atlassian.com/ex/jira/<cloudId>,
+          # NOT the site URL. Site URL + a scoped token = 401.
+          JIRA_API:   https://api.atlassian.com/ex/jira/2cf37d2c-a03e-4603-b743-863fccb9fcb5
+          JIRA_WEB:   https://upwindsecurity.atlassian.net
+          JIRA_USER:  ${{ secrets.JIRA_BOT_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_BOT_TOKEN }}
+          # Repos allowed to reference an already-closed ticket. These deploy or
+          # implement work whose authorising ticket is usually finished by the time
+          # the change lands - a version bump ships completed work, a terragrunt
+          # change implements a design that is already done. Everything else still
+          # applies here: the key must be real, exist, and not be UP-0.
+          RELAXED_REPOS: 'infra-kubernetes infra-monitoring infra-terragrunt infra-terragrunt-azure service-configurations'
+        run: |
+          set -euo pipefail
+
+          # Dependency bots are bypass actors on the ruleset (Integration:29110
+          # dependabot, 1303726 renovate) — the control decision is already made.
+          # They also CANNOT be validated even in principle: GitHub runs a
+          # Dependabot-triggered workflow against the *Dependabot* secret store,
+          # so Actions org secrets arrive empty and the credential guard below
+          # fires. Exit before it, so the check matches the policy instead of
+          # going red on every dependency PR.
+          case "${PR_AUTHOR:-}" in
+            dependabot\[bot\]|renovate\[bot\])
+              echo "::notice title=Dependency bot::$PR_AUTHOR is exempt by org policy (ruleset bypass actor); no Jira ticket required."
+              exit 0 ;;
+          esac
+
+          PUBLIC=0; [ "${IS_PRIVATE:-true}" = "false" ] && PUBLIC=1
+
+          # GitHub never exposes secrets to a workflow triggered by a fork PR, so
+          # this check CANNOT validate one. Failing would permanently block every
+          # outside contribution to the public modules — the same defect this file
+          # exists to fix. Pass with an auditable notice; accountability moves to
+          # the maintainer who merges.
+          if [ "${IS_FORK:-false}" = "true" ]; then
+            echo "::notice title=Fork PR::Secrets are never exposed to fork PRs, so the Jira ticket cannot be verified. The merging maintainer is accountable for traceability."
+            exit 0
+          fi
+
+          if [ -z "${JIRA_TOKEN:-}" ]; then
+            echo "::error title=Jira credential missing::JIRA_BOT_EMAIL / JIRA_BOT_TOKEN are not visible to this repo."
+            exit 1
+          fi
+
+          # The status code goes through a FILE, not a variable: every caller
+          # runs jira() in a subshell (command substitution or a pipe), so an
+          # exported variable never reaches the caller.
+          RAW=$(mktemp); CODE=$(mktemp); : > "$CODE"
+          jira() {  # jira <path> -> body on stdout, status via http()
+            curl -sS --max-time 20 --retry 2 --retry-connrefused \
+                 -w '\n%{http_code}' \
+                 -u "$JIRA_USER:$JIRA_TOKEN" \
+                 -H 'Accept: application/json' \
+                 "$JIRA_API$1" > "$RAW" 2>/dev/null || printf '\n000' > "$RAW"
+            tail -n1 "$RAW" > "$CODE"
+            sed '$d' "$RAW"
+          }
+          http() { cat "$CODE" 2>/dev/null || echo 000; }
+
+          # ---- 1. Live project keys ------------------------------------------
+          # Fetched every run, never hard-coded: a static list goes stale and
+          # silently blocks a whole team the day they get a new project. One
+          # call, so it is not worth caching.
+          PROJ=$(jira "/rest/api/3/project/search?maxResults=100")
+          if [ "$(http)" != "200" ]; then
+            echo "::error title=Jira unreachable::Could not list projects (HTTP $(http)). Failing closed — use the break-glass label if Jira is down."
+            exit 1
+          fi
+          printf '%s' "$PROJ" | jq -r '.values[].key' | sort -u > .jira-projects
+          [ -s .jira-projects ] || { echo "::error::Jira returned no projects."; exit 1; }
+          PROJECTS=$(paste -sd'|' .jira-projects)
+          echo "Known Jira projects: $(wc -l < .jira-projects)"
+
+          # ---- 2. Candidate keys, read LIVE (so Re-run sees an edited title) --
+          TITLE=$(gh pr view "$PR" --repo "$REPO" --json title       --jq .title)
+          BRANCH=$(gh pr view "$PR" --repo "$REPO" --json headRefName --jq .headRefName)
+          PR_CREATED=$(gh pr view "$PR" --repo "$REPO" --json createdAt --jq .createdAt)
+          # SC (Security), IT (IT Tasks) and SUP (Support) are intentionally
+          # NOT browsable by the service account — IT policy, confirmed 5 Nov.
+          # Zero of the last 1,000 org PRs referenced them, so blocking is the
+          # safe default; the message below says why rather than sending the
+          # author on a pointless errand to IT.
+          #
+          # Extract by generic shape and let Jira adjudicate. Filtering by the
+          # visible-project list would turn "the checker cannot see project DV"
+          # into "you forgot a ticket", which blames the wrong person.
+          CANDIDATES=$( { printf '%s\n' "$TITLE"; printf '%s\n' "$BRANCH"; } \
+                        | grep -oE '\b[A-Z][A-Z0-9]+-[1-9][0-9]*\b' \
+                        | awk '!seen[$0]++' || true)
+
+          RELAXED=0
+          case " $RELAXED_REPOS " in *" ${REPO##*/} "*) RELAXED=1 ;; esac
+          [ "$RELAXED" = 1 ] && echo "::notice::${REPO##*/} may reference a closed ticket."
+
+          MARKER='<!-- require-jira-ticket -->'
+          BODY=$(mktemp)
+          post() {
+            local id
+            id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                   --jq "[.[] | select(.body | contains(\"$MARKER\"))] | .[0].id // empty")
+            if [ -n "$id" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@"$BODY" >/dev/null
+            else
+              gh api -X POST "repos/$REPO/issues/$PR/comments"  -F body=@"$BODY" >/dev/null
+            fi
+          }
+
+          if [ -z "$CANDIDATES" ]; then
+          cat >"$BODY" <<EOF
+          $MARKER
+          ### This PR needs a Jira ticket
+
+          No Jira issue key found in the PR title or branch name.
+
+          **Fix — about 20 seconds:**
+
+          1. Edit the PR title so it carries the key, e.g. \`UP-12049: $TITLE\`
+          2. Press **Re-run failed jobs** on this check.
+
+          > Editing the title does not re-run the check by itself — GitHub only runs
+          > required workflows on push, so click re-run (or push a commit).
+
+          The key is checked against live Jira: the issue must exist, and must not have been
+          already closed when this PR was opened.
+          EOF
+            post
+            echo "::error title=No Jira ticket::Add an issue key to the PR title, then press Re-run failed jobs."
+            exit 1
+          fi
+
+          # ---- 3. Validate each candidate against live Jira -------------------
+          REPORT=""; GOOD=""
+          for K in $CANDIDATES; do
+            ISSUE=$(jira "/rest/api/3/issue/$K?fields=summary,status,issuetype,assignee,resolutiondate")
+
+            if [ "$(http)" = "404" ]; then
+              # A 404 also covers "exists but the checker cannot browse it".
+              # Three cases, three different messages — telling someone to ask
+              # IT for a grant IT deliberately refused would strand them.
+              case "${K%%-*}" in
+                SC|IT|SUP)
+                  REPORT="$REPORT
+          | \`$K\` | **\`${K%%-*}\` is excluded from the checker by design** | link a ticket in another project, or use break-glass |" ;;
+                *)
+                  if grep -qx "${K%%-*}" .jira-projects; then
+                    REPORT="$REPORT
+          | \`$K\` | **does not exist in Jira** | — |"
+                  else
+                    REPORT="$REPORT
+          | \`$K\` | **project \`${K%%-*}\` not visible to the checker** | ask IT to grant Browse |"
+                  fi ;;
+              esac
+              continue
+            fi
+            if [ "$(http)" != "200" ]; then
+              echo "::error title=Jira error::Lookup of $K returned HTTP $(http). Failing closed."
+              exit 1
+            fi
+
+            # Summaries here often read "Area | Subarea | Description"; an
+            # unescaped pipe shreds the markdown table it is rendered into.
+            esc() { sed 's/|/\\|/g'; }
+            SUM=$(printf '%s' "$ISSUE"  | jq -r '.fields.summary' | esc)
+            CAT=$(printf '%s' "$ISSUE"  | jq -r '.fields.status.statusCategory.key')
+            ST=$(printf '%s' "$ISSUE"   | jq -r '.fields.status.name' | esc)
+            TYPE=$(printf '%s' "$ISSUE" | jq -r '.fields.issuetype.name' | esc)
+            WHO=$(printf '%s' "$ISSUE"  | jq -r '.fields.assignee.displayName // "unassigned"' | esc)
+
+            # In a PUBLIC repo the verdict comment is world-readable. Shipping the
+            # summary and assignee would publish internal ticket titles and
+            # employee names on every PR, forever. Redact to the one bit that is
+            # not sensitive — open or closed — and keep the table shape identical.
+            if [ "$PUBLIC" = 1 ]; then
+              SUM='&mdash; <sub>hidden: public repository</sub>'
+              WHO='hidden'; TYPE='hidden'
+              case "$CAT" in done) ST='closed';; *) ST='open';; esac
+            fi
+
+            # statusCategory, NOT the status name. This site has 11 different
+            # "done" statuses (Archived, Engineering Done, Suspended, Rejected…),
+            # so name matching misses most of them.
+            #
+            # A ticket closing WHILE a PR is in flight is correct behaviour, so
+            # "closed" alone must not fail: it would punish the right workflow and
+            # a long-lived PR would flip red on an unrelated re-run. Only a ticket
+            # that was ALREADY closed when the PR was opened is retro-attaching.
+            RES=$(printf '%s' "$ISSUE" | jq -r '.fields.resolutiondate // ""')
+            if [ "$CAT" = "done" ] && [ "$RELAXED" = 1 ]; then
+              REPORT="$REPORT
+          | [\`$K\`]($JIRA_WEB/browse/$K) | $ST (closed &mdash; allowed in this repo) | $SUM |"
+              GOOD="${GOOD}$K "
+            elif [ "$CAT" = "done" ] && [ -n "$RES" ] \
+               && [ "$(date -u -d "$RES" +%s)" -lt "$(date -u -d "$PR_CREATED" +%s)" ]; then
+              REPORT="$REPORT
+          | [\`$K\`]($JIRA_WEB/browse/$K) | **closed before this PR opened** — $ST | $SUM |"
+            elif [ "$CAT" = "done" ]; then
+              REPORT="$REPORT
+          | [\`$K\`]($JIRA_WEB/browse/$K) | $ST (closed while in flight — allowed) | $SUM |"
+              GOOD="${GOOD}$K "
+            else
+              REPORT="$REPORT
+          | [\`$K\`]($JIRA_WEB/browse/$K) | $ST &middot; $TYPE &middot; $WHO | $SUM |"
+              GOOD="${GOOD}$K "
+            fi
+          done
+
+          if [ -z "$GOOD" ]; then
+          cat >"$BODY" <<EOF
+          $MARKER
+          ### Jira ticket not valid
+
+          | Key | Status | Summary |
+          | --- | --- | --- |$REPORT
+
+          No open, verifiable Jira issue was found &mdash; see the reason against each key above.
+          Fix the reference, then press **Re-run failed jobs**.
+          EOF
+            post
+            echo "::error title=Invalid Jira ticket::No open, existing issue referenced."
+            exit 1
+          fi
+
+          cat >"$BODY" <<EOF
+          $MARKER
+          ### Jira ticket verified
+
+          | Key | Status | Summary |
+          | --- | --- | --- |$REPORT
+
+          Linked automatically in the ticket's development panel.
+          EOF
+          post
+          echo "::notice title=Jira ticket verified::$GOOD"
