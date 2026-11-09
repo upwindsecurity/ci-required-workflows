@@ -24,3 +24,5 @@ the whole org, so:
 - the workflow must degrade safely — it fails closed when Jira is unreachable,
   and it must never publish Jira content into a public repository;
 - `main` is what the rulesets fetch. There is no staging branch.
+
+<!-- injection check: a PR in this public repo must receive the injected workflow -->
